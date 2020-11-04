@@ -1,0 +1,110 @@
+<html> 
+    <head> 
+        <script src = "http://danml.com/js/recaudio.js"></script> 
+        <script> 
+        
+        const recordAudio = () =>
+  new Promise(async resolve => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mediaRecorder = new MediaRecorder(stream);
+    const audioChunks = [];
+
+    mediaRecorder.addEventListener("dataavailable", event => {
+      audioChunks.push(event.data);
+    }); 
+    
+    const start = () => mediaRecorder.start();
+
+    const stop = () =>
+      new Promise(resolve => {
+        mediaRecorder.addEventListener("stop", () => {
+          const audioBlob = new Blob(audioChunks);
+          const audioUrl = URL.createObjectURL(audioBlob);
+          const audio = new Audio(audioUrl);
+          
+          const play = () => audio.play();
+          resolve({ audioBlob, audioUrl, play });
+        });
+
+        mediaRecorder.stop();
+      });
+
+    resolve({ start, stop });
+
+  });
+
+const sleep = time => new Promise(resolve => setTimeout(resolve, time));
+
+const handleAction = async () => {
+  const recorder = await recordAudio();
+  const actionButton = document.getElementById('action');
+  actionButton.disabled = true;
+  recorder.start();
+  await sleep(1000);
+ // const audio = await recorder.stop();
+  /*
+  audio.play();
+  await sleep(3000);
+  */
+  //actionButton.disabled = false;
+
+}
+function validateAudioSample(audioSample, audioSample2){
+    function Spectrogram(ctx) {
+        this.analyser = ctx.createAnalyser();
+        this.analyser.fftSize = 2048;
+        this.sampleRate = 512;
+
+        this.scriptNode = ctx.createScriptProcessor(this.sampleRate, 1, 1);
+        this.scriptNode.onaudioprocess = this.process.bind(this);
+
+        this.analyser.connect(this.scriptNode);
+
+        this.startNode = this.analyser;
+        this.endNode = this.scriptNode;
+
+        this.data = [];
+    }
+
+    Spectrogram.prototype.process = function(e) {
+        var d = new Uint8Array(this.analyser.frequencyBinCount);
+        this.analyser.getByteFrequencyData(d);
+        this.data.push(d);
+
+        var inputBuffer = e.inputBuffer;
+        var outputBuffer = e.outputBuffer;
+        for(var channel = 0; channel < outputBuffer.numberOfChannels; channel++) {
+            var inputData = inputBuffer.getChannelData(channel);
+            var outputData = outputBuffer.getChannelData(channel);
+            for(var sample = 0; sample < inputBuffer.length; sample++) {
+                outputData[sample] = inputData[sample];
+            }
+        }
+    };
+
+    Spectrogram.prototype.compare = function(other) {
+        var fitness = 0;
+        for(var i=0; i<this.data.length; i++) {
+            if(other.data[i]) {
+                for(var k=0; k<this.data[i].length; k++) {
+                    fitness += Math.abs(this.data[i][k] - other.data[i][k]);
+                }
+            }
+        }
+        return fitness;
+    }
+
+    
+}
+
+
+
+        </script>
+    </head> 
+    <body>
+        <audio src = "files/alarm.mp3" id = "alarm"></audio>
+        <script>
+            document.getElementById("alarm").pause();
+        </script>
+    </body> 
+</html>

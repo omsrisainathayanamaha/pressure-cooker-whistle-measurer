@@ -1,0 +1,852 @@
+
+<html> 
+    <head> 
+      <audio src = "files/alarm.mp3" id = "alarm"></audio>
+     
+      <script>
+        document.getElementById("alarm").pause();
+      </script>
+        <script  src =  "fftjs/fftjs/lib/real.js"></script>
+		<script src = "./fftjs/fftjs/lib/complex.js"></script>
+		<script  src = "detect-pitch/pitch.js"></script>
+		
+		
+        <script type = "module">
+
+"use strict"
+
+
+
+function square(x, y) {
+  var n = x.length
+  for(var i=0; i<n; ++i) {
+    var a = x[i], b = y[i]
+    x[i] = a*a + b*b
+    y[i] = 0.0
+  }
+}
+
+function prefilter(x, xf, n) {
+  x[0] = 1
+  var s = 0
+  for(var i=1; i<n; ++i) {
+    var d = Math.max(xf - x[i], 0.0)
+    s += d
+    x[i] = d * i / s
+  }
+}
+
+function aperiodic(x, n) {
+  if(n<=3) {
+    return true
+  }
+  var d = ((x + 0.5 * n) % n) - 0.5 * n
+  return Math.abs(d) > 1
+}
+
+function findPeriod(x, lo, hi, threshold) {
+  var smallest = 1.0
+  var period = 0
+  for(var i=lo; i+2<hi; ++i) {
+    var y0 = x[i], y1 = x[i+1], y2 = x[i+2]
+    var denom = y2 - 2.0 * y1 + y0
+    if(Math.abs(denom) < 1e-6) {
+      if(y1 < smallest && aperiodic(i+1, period)) {
+        smallest = y1
+        period = i+1
+      }
+    } else {
+      var s = 0.5 * (y0 - y2) / denom
+      if(Math.abs(s) > 1.0) {
+        continue
+      }
+      var ymin = y1 + 0.25 * Math.pow(y0 - y2, 2) / denom
+      if(ymin < smallest) {
+        var f0 = i + s + 1
+        if(aperiodic(f0, period)) {
+          smallest = ymin
+          period = f0
+        }
+      }
+    }
+  }
+  if(smallest < 1.0 - threshold) {
+    return period
+  }
+  return 0.0
+}
+
+function detectPitch(signal, threshold) {
+  threshold = threshold || 0.0
+
+  var xs
+  if(signal.shape) {
+    xs = signal.shape[0]
+  } else {
+    xs = signal.length
+  }
+
+  var n = nextPow2(2*xs)
+
+  var i, j, k
+  var re_arr = mallocFloat(n)
+  var im_arr = mallocFloat(n)
+  var X = ndarray(re_arr, [n], [1], 0)
+  var Y = ndarray(im_arr, [n], [1], 0)
+
+  //Initialize array depending on if it is a typed array
+  if(signal.shape) {
+    assign(X.hi(xs), signal)
+  } else {
+    re_arr.set(signal)
+  }
+
+  //Compute magnitude
+  var magnitude = 0.0
+  for(var i=0; i<xs; ++i) {
+    var z = re_arr[i] *= hann(i, xs)
+    magnitude += Math.pow(z, 2)
+  }
+
+  //Zero out arrays
+  for(var i=xs; i<n; ++i) {
+    re_arr[i] = 0.0
+  }
+  for(var i=0; i<n; ++i) {
+    im_arr[i] = 0.0
+  }
+
+  //Autocorrelate
+  fft(1, X, Y)
+  square(re_arr, im_arr)
+  fft(-1, X, Y)
+
+  //Apply prefiltering
+  prefilter(re_arr, magnitude, xs)
+
+  //Detect pitch
+  var period = findPeriod(re_arr, 0, xs>>>1, threshold)
+
+  //Free temporary arrays
+  freeFloat(re_arr)
+  freeFloat(im_arr)
+
+  return period
+}
+export default detectPitch;
+        </script>
+        
+        <script type = "module">
+
+          /*global PitchAnalyzer:true, Float32Array:false, FFT:false */
+/*jshint undef:true node:true browser:true */
+
+let PitchAnalyzer = (function () {
+
+var	pi	= Math.PI,
+	pi2	= pi * 2,
+	cos	= Math.cos,
+	pow	= Math.pow,
+	log	= Math.log,
+	max	= Math.max,
+	min	= Math.min,
+	abs	= Math.abs,
+	LN10	= Math.LN10,
+	sqrt	= Math.sqrt,
+	atan2	= Math.atan2,
+	round	= Math.round,
+	inf	= 1/0,
+	FFT_P	= 10,
+	FFT_N	= 1 << FFT_P,
+	BUF_N	= FFT_N * 2;
+
+function remainder (val, div) {
+	return val - round(val/div) * div;
+}
+
+function extend (obj) {
+	var	args	= arguments,
+		l	= args.length,
+		i, n;
+
+
+	for (i=1; i<l; i++){
+		for (n in args[i]){
+			if (args[i].hasOwnProperty(n)){
+				obj[n] = args[i][n];
+			}
+		}
+	}
+
+	return obj;
+}
+
+/**
+ * A class for tones.
+ *
+ * @class
+ * @static PitchAnalyzer
+ * @param default:0.0 min:0.0 type:Number freq The frequency of the tone.
+ * @param default:-Infinity max:0.0 type:Number db The volume of the tone.
+ * @param default:-Infinity max:0.0 type:Number stabledb An average of the volume of the tone.
+ * @param default:0 min:0 type:Integer age How many times the tone has been detected in a row.
+*/
+function Tone () {
+	this.harmonics = new Float32Array(Tone.MAX_HARM);
+}
+
+Tone.prototype = {
+	freq: 0.0,
+	db: -inf,
+	stabledb: -inf,
+	age: 0,
+
+	toString: function () {
+		return '{freq: ' + this.freq + ', db: ' + this.db + ', stabledb: ' + this.stabledb + ', age: ' + this.age + '}';
+	},
+
+/**
+ * Return an approximation of whether the tone has the same frequency as provided.
+ *
+ * @method Tone
+ * @private
+ * @arg {Number} freq The frequency to compare to.
+ * @return {Boolean} Whether it was a match.
+*/
+	matches: function (freq) {
+		return abs(this.freq / freq - 1.0) < 0.05;
+	},
+
+	harmonics: null
+};
+
+Tone.MIN_AGE = 2;
+Tone.MAX_HARM = 48;
+
+/**
+ * An internal class to manage the peak frequencies detected.
+ *
+ * @private
+ * @class
+ * @static PitchAnalyzer
+ * @arg default:0.0 min:0.0 type:Number !freq The frequency of the peak.
+ * @arg default:-Infinity max:0.0 type:Number !db The volume of the peak.
+*/
+function Peak (freq, db) {
+	this.freq = typeof freq === 'undefined' ? this.freq : freq;
+	this.db = typeof db === 'undefined' ? this.db : db;
+
+	this.harm = new Array(Tone.MAX_HARM);
+}
+
+Peak.prototype = {
+	harm: null,
+
+	freq: 0.0,
+	db: -inf,
+
+/**
+ * Resets the peak to default values.
+ *
+ * @method Peak
+ * @private
+*/
+	clear: function () {
+		this.freq	= Peak.prototype.freq;
+		this.db		= Peak.prototype.db;
+	}
+};
+
+/**
+ * Finds the best matching peak from a certain point in the array of peaks.
+ *
+ * @name match
+ * @static Peak
+ * @private
+ * @arg {Array} peaks The peaks to search from.
+ * @arg {Integer} pos The position to find the match for.
+ * @return {Peak} The best matching peak.
+*/
+Peak.match = function (peaks, pos) {
+	var best = pos;
+
+	if (peaks[pos - 1].db > peaks[best].db) best = pos - 1;
+	if (peaks[pos + 1].db > peaks[best].db) best = pos + 1;
+
+	return peaks[best];
+};
+
+/**
+ * A class to analyze pitch from input data.
+ *
+ * @class PitchAnalyzer
+ * @arg {Object} !options Options to override default values.
+*/
+function Analyzer (options) {
+	options = extend(this, options);
+
+	this.data = new Float32Array(FFT_N);
+	this.buffer = new Float32Array(BUF_N);
+	this.fftLastPhase = new Float32Array(BUF_N);
+	this.tones = [];
+
+	if (this.wnd === null) this.wnd = Analyzer.calculateWindow();
+	this.setupFFT();
+}
+
+Analyzer.prototype = {
+	wnd: null,
+	data: null,
+	fft: null,
+	tones: null,
+	fftLastPhase: null,
+	buffer: null,
+
+	offset: 0,
+	bufRead: 0,
+	bufWrite: 0,
+
+	MIN_FREQ: 45,
+	MAX_FREQ: 5000,
+
+	sampleRate: 44100,
+	step: 200,
+	oldFreq: 0.0,
+
+	peak: 0.0,
+
+/**
+ * Gets the current peak level in dB (negative value, 0.0 = clipping).
+ *
+ * @method PitchAnalyzer
+ * @return {Number} The current peak level (db).
+*/
+	getPeak: function () {
+		return 10.0 * log(this.peak) / LN10;
+	},
+
+	findTone: function (minFreq, maxFreq) {
+		if (!this.tones.length) {
+			this.oldFreq = 0.0;
+			return null;
+		}
+
+		minFreq = typeof minFreq === 'undefined' ? 65.0 : minFreq;
+		maxFreq = typeof maxFreq === 'undefined' ? 1000.0 : maxFreq;
+
+		var db = max.apply(null, this.tones.map(Analyzer.mapdb));
+		var best = null;
+		var bestscore = 0;
+
+		for (var i=0; i<this.tones.length; i++) {
+			if (this.tones[i].db < db - 20.0 || this.tones[i].freq < minFreq || this.tones[i].age < Tone.MIN_AGE) continue;
+			if (this.tones[i].freq > maxFreq) break;
+
+			var score = this.tones[i].db - max(180.0, abs(this.tones[i].freq - 300)) / 10.0;
+
+			if (this.oldFreq !== 0.0 && abs(this.tones[i].freq / this.oldFreq - 1.0) < 0.05) score += 10.0;
+			if (best && bestscore > score) break;
+
+			best = this.tones[i];
+			bestscore = score;
+		}
+
+		this.oldFreq = (best ? best.freq : 0.0);
+		return best;
+	},
+
+/**
+ * Copies data to the internal buffers for processing and calculates peak.
+ * Note that if the buffer overflows, unprocessed data gets discarded.
+ *
+ * @method PitchAnalyzer
+ * @arg {Float32Array} data The input data.
+*/
+	input: function (data) {
+		var buf = this.buffer;
+		var r = this.bufRead;
+		var w = this.bufWrite;
+
+		var overflow = false;
+
+		for (var i=0; i<data.length; i++) {
+			var s = data[i];
+			var p = s * s;
+
+			if (p > this.peak) this.peak = p; else this.peak *= 0.999;
+
+			buf[w] = s;
+
+			w = (w + 1) % BUF_N;
+
+			if (w === r) overflow = true;
+		}
+
+		this.bufWrite = w;
+		if (overflow) this.bufRead = (w + 1) % BUF_N;
+	},
+
+/**
+ * Processes available data and calculates tones.
+ *
+ * @method PitchAnalyzer
+*/
+	process: function () {
+		while (this.calcFFT()) this.calcTones();
+	},
+
+/**
+ * Matches new tones against old ones, merging similar ones.
+ *
+ * @method PitchAnalyzer
+ * @private
+*/
+	mergeWithOld: function (tones) {
+		var i, n;
+
+		tones.sort(function (a, b) { return a.freq < b.freq ? -1 : a.freq > b.freq ? 1 : 0; });
+
+		for (i=0, n=0; i<this.tones.length; i++) {
+			while (n < tones.length && tones[n].freq < this.tones[i].freq) n++;
+
+			if (n < tones.length && tones[n].matches(this.tones[i].freq)) {
+				tones[n].age = this.tones[i].age + 1;
+				tones[n].stabledb = 0.8 * this.tones[i].stabledb + 0.2 * tones[n].db;
+				tones[n].freq = 0.5 * (this.tones[i].freq + tones[n].freq);
+			} else if (this.tones[i].db > -80.0) {
+				tones.splice(n, 0, this.tones[i]);
+				tones[n].db -= 5.0;
+				tones[n].stabledb -= 0.1;
+			}
+
+		}
+	},
+
+/**
+ * Calculates the tones from the FFT data.
+ *
+ * @method PitchAnalyzer
+ * @private
+*/
+	calcTones: function () {
+		var	freqPerBin	= this.sampleRate / FFT_N,
+			phaseStep	= pi2 * this.step / FFT_N,
+			normCoeff	= 1.0 / FFT_N,
+			minMagnitude	= pow(10, -100.0 / 20.0) / normCoeff,
+			kMin		= ~~max(1, this.MIN_FREQ / freqPerBin),
+			kMax		= ~~min(FFT_N / 2, this.MAX_FREQ / freqPerBin),
+			peaks		= [],
+			tones		= [],
+			k, k2, p, n, t, count, freq, magnitude, phase, delta, prevdb, db, bestDiv,
+			bestScore, div, score;
+
+		for (k=0; k <= kMax; k++) {
+			peaks.push(new Peak());
+		}
+
+		for (k=1, k2=2; k<=kMax; k++, k2 += 2) {
+			/* complex absolute */
+			magnitude = sqrt(this.fft[k2] * this.fft[k2] + this.fft[k2+1] * this.fft[k2+1]);
+			/* complex arguscosine */
+			phase = atan2(this.fft[k2+1], this.fft[k2]);
+
+			delta = phase - this.fftLastPhase[k];
+			this.fftLastPhase[k] = phase;
+
+			delta -= k * phaseStep;
+			delta = remainder(delta, pi2);
+			delta /= phaseStep;
+
+			freq = (k + delta) * freqPerBin;
+
+			if (freq > 1.0 && magnitude > minMagnitude) {
+				peaks[k].freq = freq;
+				peaks[k].db = 20.0 * log(normCoeff * magnitude) / LN10;
+			}
+		}
+
+		prevdb = peaks[0].db;
+
+		for (k=1; k<kMax; k++) {
+			db = peaks[k].db;
+			if (db > prevdb) peaks[k - 1].clear();
+			if (db < prevdb) peaks[k].clear();
+			prevdb = db;
+		}
+
+		for (k=kMax-1; k >= kMin; k--) {
+			if (peaks[k].db < -70.0) continue;
+
+			bestDiv = 1;
+			bestScore = 0;
+
+			for (div = 2; div <= Tone.MAX_HARM && k / div > 1; div++) {
+				freq = peaks[k].freq / div;
+				score = 0;
+
+				for (n=1; n<div && n<8; n++) {
+					p = Peak.match(peaks, ~~(k * n / div));
+					score--;
+					if (p.db < -90.0 || abs(p.freq / n / freq - 1.0) > 0.03) continue;
+					if (n === 1) score += 4;
+					score += 2;
+				}
+
+				if (score > bestScore) {
+					bestScore = score;
+					bestDiv = div;
+				}
+			}
+
+			t = new Tone();
+
+			count = 0;
+
+			freq = peaks[k].freq / bestDiv;
+
+			t.db = peaks[k].db;
+
+			for (n=1; n<=bestDiv; n++) {
+				p = Peak.match(peaks, ~~(k * n / bestDiv));
+
+				if (abs(p.freq / n / freq - 1.0) > 0.03) continue;
+
+				if (p.db > t.db - 10.0) {
+					t.db = max(t.db, p.db);
+					count++;
+					t.freq += p.freq / n;
+				}
+
+				t.harmonics[n - 1] = p.db;
+				p.clear();
+			}
+
+			t.freq /= count;
+
+			if (t.db > -50.0 - 3.0 * count) {
+				t.stabledb = t.db;
+				tones.push(t);
+			}
+		}
+
+		this.mergeWithOld(tones);
+
+		this.tones = tones;
+	},
+
+/**
+ * Calculates the FFT for the input signal, if enough is available.
+ *
+ * @method PitchAnalyzer
+ * @private
+ * @return {Boolean} Whether there was enough data to process.
+*/
+	calcFFT: function () {
+		var r = this.bufRead;
+
+		if ((BUF_N + this.bufWrite - r) % BUF_N <= FFT_N) return false;
+
+		for (var i=0; i<FFT_N; i++) {
+			this.data[i] = this.buffer[(r + i) % BUF_N];
+		}
+
+		this.bufRead = (r + this.step) % BUF_N;
+
+		this.processFFT(this.data, this.wnd);
+
+		return true;
+	},
+
+	setupFFT: function () {
+		var RFFT = typeof FFT !== 'undefined' && FFT;
+
+		if (!RFFT) {
+			try {
+				RFFT = require('fft');
+			} catch (e) {
+				throw Error("pitch.js requires fft.js");
+			}
+		}
+
+		RFFT = RFFT.complex;
+
+		this.rfft = new RFFT(FFT_N, false);
+		this.fft = new Float32Array(FFT_N * 2);
+		this.fftInput = new Float32Array(FFT_N);
+	},
+
+	processFFT: function (data, wnd) {
+		var i;
+
+		for (i=0; i<data.length; i++) {
+			this.fftInput[i] = data[i] * wnd[i];
+		}
+
+		this.rfft.simple(this.fft, this.fftInput, 'real');
+	}
+};
+
+Analyzer.mapdb = function (e) {
+	return e.db;
+};
+
+Analyzer.Tone = Tone;
+
+/**
+ * Calculates a Hamming window for the size FFT_N, scaled up with FFT_N.
+ *
+ * @static PitchAnalyzer
+ * @return {Float32Array} The hamming window.
+*/
+Analyzer.calculateWindow = function () {
+	var	i,
+		w = new Float32Array(FFT_N);
+
+	for (i=0; i<FFT_N; i++) {
+		w[i] = 0.53836 - 0.46164 * cos(pi2 * i / (FFT_N - 1));
+	}
+
+	return w;
+};
+
+return Analyzer;
+
+}());
+
+if (typeof module !== 'undefined') {
+	module.exports = PitchAnalyzer;
+}
+        </script>
+     
+        
+        <script type = "module">
+
+
+
+var whistles = 0;
+var numberOfWhistlesNeeded = parseInt(prompt("Please enter how many whistles you need."));
+while(isNaN(numberOfWhistlesNeeded) == true){
+  numberOfWhistlesNeeded = parseInt(prompt("Please enter how many whistles you need. This time, enter a numeric value."));
+}
+numberOfWhistlesNeeded = Math.round(numberOfWhistlesNeeded);
+var  pressure1Blob;
+var pressure2Blob;
+var pressure3Blob;
+//Put files on some server of some sort.
+const fetchFiles= async () =>{
+var pressure1 = await fetch("./files/Pressure Cooker 1.m4a");
+sessionStorage.setItem("pressure1Blob", (URL.createObjectURL(JSON.stringify(pressure1))));
+var pressure2 = await fetch("./files/Pressure Cooker 2.m4a");
+sessionStorage.setItem("pressure2blob", URL.createObjectURL(JSON.stringify(await pressure2.blob())));
+var pressure3 = await fetch("./files/Pressure Cooker 3.m4a");
+sessionStorage.setItem("pressure3blob", URL.createObjectURL(JSON.stringify(await pressure3.blob())));
+}
+fetchFiles();
+
+var audio1 = new Audio(sessionStorage.getItem("pressure1Blob"));
+var audio2 = new Audio(sessionStorage.getItem("pressure2blob"));
+var audio3 = new Audio(sessionStorage.getItem("pressure3blob"));
+
+
+var fileArray = [audio1, audio2, audio3];
+const recordAudio = async() => {
+    return new Promise(resolve => {
+      navigator.mediaDevices.getUserMedia({ audio: true })
+        .then(stream => {
+          const mediaRecorder = new MediaRecorder(stream); //MediaRecorder is any, maybe thats the problem.
+          const audioChunks = [];
+  
+          mediaRecorder.addEventListener("dataavailable", event => {
+            audioChunks.push(event.data);
+          });
+  
+          const start = () => {
+            mediaRecorder.start();
+          };
+  
+          const stop = async() => {
+            return new Promise(resolve => {
+              mediaRecorder.addEventListener("stop", () => {
+                const audioBlob = new Blob(audioChunks);
+                const audioUrl = URL.createObjectURL(audioBlob);
+                const audio = new Audio(audioUrl);
+                const play = async() => {
+                  await audio.play();
+                };
+  
+                resolve({ audioBlob, audioUrl, play });
+              });
+  
+              mediaRecorder.stop(); 
+            });
+          };
+  
+          resolve({ start, stop });
+        });
+    });
+  };
+  function validateAudioSamples(audioSample1, against){
+	var channels,
+          rate,
+          frameBufferLength,
+          fft;
+
+      function loadedMetadata() {
+        channels          = audio.mozChannels;
+        rate              = audio.mozSampleRate;
+        frameBufferLength = audio.mozFrameBufferLength;
+         
+        fft = new FFT(frameBufferLength / channels, rate);
+      }
+
+      function audioAvailable(event) {
+        var fb = event.frameBuffer,
+            t  = event.time, /* unused, but it's there */
+            signal = new Float32Array(fb.length / channels),
+            magnitude;
+
+        for (var i = 0, fbl = frameBufferLength / 2; i < fbl; i++ ) {
+          // Assuming interlaced stereo channels,
+          // need to split and merge into a stero-mix mono signal
+          signal[i] = (fb[2*i] + fb[2*i+1]) / 2;
+        }
+
+        fft.forward(signal);
+
+        // Clear the canvas before drawing spectrum
+        ctx.clearRect(0,0, canvas.width, canvas.height);
+
+        for (var i = 0; i < fft.spectrum.length; i++ ) {
+          // multiply spectrum by a zoom value
+          magnitude = fft.spectrum[i] * 4000;
+
+          // Draw rectangle bars for each frequency bin
+          ctx.fillRect(i * 4, canvas.height, 3, -magnitude);
+        }
+      }
+
+      var audio = audioSample1;
+      audio.addEventListener('MozAudioAvailable', audioAvailable, false);
+      audio.addEventListener('loadedmetadata', loadedMetadata, false);
+
+      // FFT from dsp.js, see below
+      var FFT = function(bufferSize, sampleRate) {
+        this.bufferSize   = bufferSize;
+        this.sampleRate   = sampleRate;
+        this.spectrum     = new Float32Array(bufferSize/2);
+        this.real         = new Float32Array(bufferSize);
+        this.imag         = new Float32Array(bufferSize);
+        this.reverseTable = new Uint32Array(bufferSize);
+        this.sinTable     = new Float32Array(bufferSize);
+        this.cosTable     = new Float32Array(bufferSize);
+
+        var limit = 1,
+            bit = bufferSize >> 1;
+
+        while ( limit < bufferSize ) {
+          for ( var i = 0; i < limit; i++ ) {
+            this.reverseTable[i + limit] = this.reverseTable[i] + bit;
+          }
+
+          limit = limit << 1;
+          bit = bit >> 1;
+        }
+
+        for ( var i = 0; i < bufferSize; i++ ) {
+          this.sinTable[i] = Math.sin(-Math.PI/i);
+          this.cosTable[i] = Math.cos(-Math.PI/i);
+        }
+      };
+
+      FFT.prototype.forward = function(buffer) {
+        var bufferSize   = this.bufferSize,
+            cosTable     = this.cosTable,
+            sinTable     = this.sinTable,
+            reverseTable = this.reverseTable,
+            real         = this.real,
+            imag         = this.imag,
+            spectrum     = this.spectrum;
+
+        if ( bufferSize !== buffer.length ) {
+          throw "Supplied buffer is not the same size as defined FFT. FFT Size: " + bufferSize + " Buffer Size: " + buffer.length;
+        }
+
+        for ( var i = 0; i < bufferSize; i++ ) {
+          real[i] = buffer[reverseTable[i]];
+          imag[i] = 0;
+        }
+
+        var halfSize = 1,
+            phaseShiftStepReal,	
+            phaseShiftStepImag,
+            currentPhaseShiftReal,
+            currentPhaseShiftImag,
+            off,
+            tr,
+            ti,
+            tmpReal,	
+            i;
+
+        while ( halfSize < bufferSize ) {
+          phaseShiftStepReal = cosTable[halfSize];
+          phaseShiftStepImag = sinTable[halfSize];
+          currentPhaseShiftReal = 1.0;
+          currentPhaseShiftImag = 0.0;
+
+          for ( var fftStep = 0; fftStep < halfSize; fftStep++ ) {
+            i = fftStep;
+
+            while ( i < bufferSize ) {
+              off = i + halfSize;
+              tr = (currentPhaseShiftReal * real[off]) - (currentPhaseShiftImag * imag[off]);
+              ti = (currentPhaseShiftReal * imag[off]) + (currentPhaseShiftImag * real[off]);
+
+              real[off] = real[i] - tr;
+              imag[off] = imag[i] - ti;
+              real[i] += tr;
+              imag[i] += ti;
+
+              i += halfSize << 1;
+            }
+
+            tmpReal = currentPhaseShiftReal;
+            currentPhaseShiftReal = (tmpReal * phaseShiftStepReal) - (currentPhaseShiftImag * phaseShiftStepImag);
+            currentPhaseShiftImag = (tmpReal * phaseShiftStepImag) + (currentPhaseShiftImag * phaseShiftStepReal);
+          }
+
+          halfSize = halfSize << 1;
+	}
+
+        i = bufferSize/2;
+        while(i--) {
+          spectrum[i] = 2 * Math.sqrt(real[i] * real[i] + imag[i] * imag[i]) / bufferSize;
+	}
+      };
+  }
+ 
+  
+(async () => {
+  const recorder = await recordAudio();
+    
+  
+    setInterval(async () => {
+      recorder.start();
+  
+      const audio = await recorder.stop();
+      //Here comes the validation part: validate the audio against the other files in the fileArray.
+     for(var ju in fileArray){
+     var bool =  validateAudioSamples(audio, fileArray[ju]);
+     if(bool == true){
+       whistles++;
+     }
+     }
+     if(numberOfWhistlesNeeded == whistles){
+       document.getElementById("alarm").play();
+     }
+      
+    }, 1000);
+  })();
+</script> 
+</head> 
+</html>
+ 
